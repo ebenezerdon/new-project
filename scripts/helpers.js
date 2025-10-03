@@ -1,167 +1,203 @@
-(function(window){
+// helpers.js
+// Pure helper functions for file handling, exif parsing, image cleaning, and storage.
+// Uses jQuery where DOM interaction is required; otherwise plain JS.
+
+/* Expose Helpers on window.Helpers so other modules can call utility functions. */
+window.Helpers = window.Helpers || {};
+
+(function (H, $) {
   'use strict';
 
-  // Helpers module - data persistence, date utilities, and validation
-  window.AppHelpers = window.AppHelpers || {};
-
-  const STORAGE_KEY = 'grat-journal-v1';
-
-  // Utility: get ISO date string for local date (yyyy-mm-dd)
-  function todayISO(){
-    const d = new Date();
-    const tz = d.getTimezoneOffset() * 60000;
-    const local = new Date(d - tz);
-    return local.toISOString().slice(0,10);
-  }
-
-  // Format date for display
-  function formatDate(iso){
-    try{
-      const d = new Date(iso + 'T00:00:00');
-      return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
-    }catch(e){
-      return iso;
-    }
-  }
-
-  // Load entries from localStorage
-  function loadEntries(){
-    try{
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if(!raw) return [];
-      const parsed = JSON.parse(raw);
-      if(!Array.isArray(parsed)) return [];
-      // Ensure date and id types
-      return parsed.map(e => ({ id: e.id, date: String(e.date), content: String(e.content), prompt: e.prompt || null, createdAt: e.createdAt || null }));
-    }catch(e){
-      console.error('Failed to load entries', e);
-      return [];
-    }
-  }
-
-  function saveEntries(entries){
-    try{
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(entries));
-      return true;
-    }catch(e){
-      console.error('Failed to save entries', e);
-      return false;
-    }
-  }
-
-  // Create a simple unique id
-  function uid(){
-    return 'g-' + Math.random().toString(36).slice(2,9);
-  }
-
-  function addEntry({date, content, prompt}){
-    if(!date) date = todayISO();
-    const entries = loadEntries();
-    const item = { id: uid(), date: String(date), content: String(content), prompt: prompt || null, createdAt: new Date().toISOString() };
-    entries.push(item);
-    saveEntries(entries);
-    return item;
-  }
-
-  function updateEntry(id, updates){
-    const entries = loadEntries();
-    const idx = entries.findIndex(e => e.id === id);
-    if(idx === -1) return false;
-    entries[idx] = Object.assign({}, entries[idx], updates);
-    saveEntries(entries);
-    return true;
-  }
-
-  function deleteEntry(id){
-    let entries = loadEntries();
-    const before = entries.length;
-    entries = entries.filter(e => e.id !== id);
-    saveEntries(entries);
-    return entries.length < before;
-  }
-
-  // Returns a set of ISO dates that have at least one entry
-  function dateSet(entries){
-    const s = new Set();
-    (entries || loadEntries()).forEach(e => s.add(String(e.date)));
-    return s;
-  }
-
-  // Calculate current streak ending today
-  function calculateStreak(entries){
-    const set = dateSet(entries);
-    let streak = 0;
-    let longest = 0;
-
-    // Compute current streak ending today
-    let cursor = todayISO();
-    while(set.has(cursor)){
-      streak++;
-      const d = new Date(cursor + 'T00:00:00');
-      d.setDate(d.getDate() - 1);
-      cursor = d.toISOString().slice(0,10);
-    }
-
-    // Compute longest streak anywhere
-    // Sort dates ascending
-    const sorted = Array.from(set).sort();
-    let run = 0;
-    for(let i=0;i<sorted.length;i++){
-      if(i===0){ run = 1; } else {
-        const prev = new Date(sorted[i-1] + 'T00:00:00');
-        const curr = new Date(sorted[i] + 'T00:00:00');
-        const diff = (curr - prev) / (24*60*60*1000);
-        if(diff === 1){ run++; } else { run = 1; }
+  // Safe localStorage wrapper
+  H.storage = {
+    get(key, fallback) {
+      try {
+        const raw = localStorage.getItem(key);
+        return raw ? JSON.parse(raw) : fallback;
+      } catch (e) {
+        console.error('Storage.get failed', e);
+        return fallback;
       }
-      if(run > longest) longest = run;
+    },
+    set(key, value) {
+      try {
+        localStorage.setItem(key, JSON.stringify(value));
+      } catch (e) {
+        console.error('Storage.set failed', e);
+      }
+    }
+  };
+
+  // Read a File as ArrayBuffer
+  H.readArrayBuffer = function (file) {
+    return new Promise(function (resolve, reject) {
+      const fr = new FileReader();
+      fr.onerror = function () { reject(new Error('Failed to read file as ArrayBuffer')); };
+      fr.onload = function () { resolve(fr.result); };
+      fr.readAsArrayBuffer(file);
+    });
+  };
+
+  // Read a File as DataURL for thumbnails
+  H.readDataURL = function (file) {
+    return new Promise(function (resolve, reject) {
+      const fr = new FileReader();
+      fr.onerror = function () { reject(new Error('Failed to read file as DataURL')); };
+      fr.onload = function () { resolve(fr.result); };
+      fr.readAsDataURL(file);
+    });
+  };
+
+  // Format bytes human-friendly
+  H.formatBytes = function (bytes) {
+    if (bytes === 0) return '0 B';
+    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(1024));
+    return parseFloat((bytes / Math.pow(1024, i)).toFixed(2)) + ' ' + sizes[i];
+  };
+
+  // Read basic EXIF orientation from JPEG ArrayBuffer. Returns orientation number 1-8 or 1 by default.
+  H.getOrientation = function (arrayBuffer) {
+    try {
+      const view = new DataView(arrayBuffer);
+      if (view.getUint16(0, false) !== 0xFFD8) return 1; // not JPEG
+      let offset = 2;
+      const length = view.byteLength;
+      while (offset < length) {
+        if (view.getUint16(offset + 2, false) <= 8) return 1;
+        const marker = view.getUint16(offset, false);
+        offset += 2;
+        if (marker === 0xFFE1) {
+          // APP1 found
+          const app1Length = view.getUint16(offset, false);
+          offset += 2;
+          const exifHeader = offset;
+          if (view.getUint32(offset, false) !== 0x45786966) return 1; // not "Exif"
+          offset += 6; // skip "Exif\0\0"
+          const little = view.getUint16(offset, false) === 0x4949;
+          offset += view.getUint32(offset + 4, little);
+          const tags = view.getUint16(offset, little);
+          offset += 2;
+          for (let i = 0; i < tags; i++) {
+            const tagOffset = offset + i * 12;
+            const tag = view.getUint16(tagOffset, little);
+            if (tag === 0x0112) {
+              const orientation = view.getUint16(tagOffset + 8, little);
+              return orientation || 1;
+            }
+          }
+        } else if ((marker & 0xFF00) !== 0xFF00) break;
+        else offset += view.getUint16(offset, false);
+      }
+    } catch (e) {
+      console.warn('Orientation read failed', e);
+    }
+    return 1;
+  };
+
+  // Create an Image element from a Blob or DataURL
+  H.createImage = function (source) {
+    return new Promise(function (resolve, reject) {
+      const img = new Image();
+      img.onload = function () { resolve(img); };
+      img.onerror = function (e) { reject(new Error('Image load failed')); };
+      img.crossOrigin = 'anonymous';
+      img.src = source;
+    });
+  };
+
+  // Draw image into canvas, preserving orientation, and return a Blob of cleaned image (metadata removed)
+  H.cleanImage = async function (file, options) {
+    options = options || {};
+    const quality = typeof options.quality === 'number' ? options.quality : 0.92;
+    const maxWidth = options.maxWidth || 0; // 0 means keep original
+
+    let arrayBuffer;
+    try {
+      arrayBuffer = await H.readArrayBuffer(file);
+    } catch (e) {
+      throw new Error('Failed to read file to clean');
     }
 
-    return { current: streak, longest };
-  }
+    const orientation = H.getOrientation(arrayBuffer) || 1;
 
-  // Simple validation
-  function validateEntry(content){
-    if(!content || String(content).trim().length < 3){
-      return { ok:false, message: 'Please enter at least a short sentence.' };
+    // Read as dataURL for image creation
+    const dataURL = await H.readDataURL(file);
+    const img = await H.createImage(dataURL);
+
+    // Determine target dimensions
+    let sw = img.naturalWidth;
+    let sh = img.naturalHeight;
+    let dw = sw;
+    let dh = sh;
+
+    if (maxWidth > 0 && dw > maxWidth) {
+      const ratio = maxWidth / dw;
+      dw = Math.round(dw * ratio);
+      dh = Math.round(dh * ratio);
     }
-    if(String(content).length > 2000){
-      return { ok:false, message: 'Entry is too long. Keep it concise.' };
+
+    // For orientations that rotate, swap width/height
+    const rotated = [5,6,7,8].indexOf(orientation) >= 0;
+    const canvas = document.createElement('canvas');
+    canvas.width = rotated ? dh : dw;
+    canvas.height = rotated ? dw : dh;
+    const ctx = canvas.getContext('2d');
+
+    // Apply transform based on EXIF orientation
+    switch (orientation) {
+      case 2: ctx.transform(-1, 0, 0, 1, canvas.width, 0); break; // flip horizontal
+      case 3: ctx.transform(-1, 0, 0, -1, canvas.width, canvas.height); break; // rotate 180
+      case 4: ctx.transform(1, 0, 0, -1, 0, canvas.height); break; // flip vertical
+      case 5: ctx.transform(0, 1, 1, 0, 0, 0); break; // transpose
+      case 6: ctx.transform(0, 1, -1, 0, canvas.height, 0); break; // rotate 90
+      case 7: ctx.transform(0, -1, -1, 0, canvas.height, canvas.width); break; // transverse
+      case 8: ctx.transform(0, -1, 1, 0, 0, canvas.width); break; // rotate 270
+      default: break; // 1 - no transform
     }
-    return { ok:true };
-  }
 
-  // Basic prompt generator with rotation
-  const PROMPTS = [
-    'What made you smile today?',
-    'Name one small victory from today.',
-    'Who are you grateful for and why?',
-    'List three things that felt nourishing today.',
-    'What challenged you and what did you learn?',
-    'Describe a moment you want to remember.',
-    'What did you do today that aligned with your values?'
-  ];
-
-  function getRandomPrompt(){
-    try{
-      const idx = Math.floor(Math.random() * PROMPTS.length);
-      return PROMPTS[idx];
-    }catch(e){
-      return PROMPTS[0];
+    // Draw image into canvas scaled to requested size while respecting orientation transform
+    try {
+      ctx.drawImage(img, 0, 0, sw, sh, 0, 0, dw, dh);
+    } catch (e) {
+      // fallback simple draw
+      ctx.drawImage(img, 0, 0);
     }
-  }
 
-  // Export
-  window.AppHelpers.STORAGE_KEY = STORAGE_KEY;
-  window.AppHelpers.todayISO = todayISO;
-  window.AppHelpers.formatDate = formatDate;
-  window.AppHelpers.loadEntries = loadEntries;
-  window.AppHelpers.saveEntries = saveEntries;
-  window.AppHelpers.addEntry = addEntry;
-  window.AppHelpers.updateEntry = updateEntry;
-  window.AppHelpers.deleteEntry = deleteEntry;
-  window.AppHelpers.calculateStreak = calculateStreak;
-  window.AppHelpers.validateEntry = validateEntry;
-  window.AppHelpers.getRandomPrompt = getRandomPrompt;
-  window.AppHelpers.PROMPTS = PROMPTS;
+    // Export blob - prefer original mime type when possible
+    const outType = (file.type === 'image/png' || file.type === 'image/webp') ? file.type : 'image/jpeg';
 
-})(window);
+    return new Promise(function (resolve, reject) {
+      canvas.toBlob(function (blob) {
+        if (!blob) return reject(new Error('Failed to export cleaned blob'));
+        // Choose a safe filename
+        const ext = outType === 'image/png' ? 'png' : (outType === 'image/webp' ? 'webp' : 'jpg');
+        const cleanedName = (file.name || 'image') .replace(/\.[^/.]+$/, '') + '.cleaned.' + ext;
+        resolve({ blob: blob, cleanedName: cleanedName, mime: outType, width: canvas.width, height: canvas.height });
+      }, outType, quality);
+    });
+  };
+
+  // Create downloadable object URL and auto-revoke after some time to free memory
+  H.createDownloadLink = function (blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    return { url: url, anchor: a };
+  };
+
+  // Create a simple single-file gallery HTML that embeds base64 images for bulk export
+  H.createGalleryHTML = async function (items) {
+    // items: [{name, dataURL, width, height}]
+    const now = new Date();
+    const title = 'Cleaned Photos - ' + now.toLocaleString();
+    const html = [`<!doctype html>`, `<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><style>body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial;background:#f8fafc;color:#0f172a;padding:18px}img{max-width:100%;height:auto;border-radius:8px;box-shadow:0 2px 8px rgba(2,6,23,0.06);margin-bottom:8px}figure{margin:18px 0;padding:12px;background:#fff;border-radius:10px}figcaption{color:#6b7280;font-size:13px}</style></head><body><h1>${title}</h1><div>`];
+    for (const it of items) {
+      html.push(`<figure><img src="${it.dataURL}" alt="${it.name}"><figcaption>${it.name} — ${it.width}x${it.height}</figcaption></figure>`);
+    }
+    html.push('</div></body></html>');
+    return html.join('');
+  };
+
+})(window.Helpers, jQuery);
